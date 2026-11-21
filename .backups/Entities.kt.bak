@@ -1,0 +1,57 @@
+package com.example.data.local
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+enum class TrafficLightDecision {
+    GREEN,
+    YELLOW,
+    RED
+}
+
+enum class NeighborhoodStatus {
+    PREFERRED,
+    NEUTRAL,
+    AVOIDED
+}
+
+enum class OfferCaptureSource {
+    ACCESSIBILITY,
+    OCR_SCREENSHOT,
+    OCR_IMAGE,
+    MANUAL
+}
+
+@Entity(tableName = "analyzed_offers")
+data class AnalyzedOfferEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val timestamp: Long = System.currentTimeMillis(),
+    val source: String,
+    val rawSnippet: String,
+    val offerPriceBrl: Double,
+    val pickupAddress: String,
+    val pickupNeighborhood: String,
+    val customerAddress: String,
+    val customerNeighborhood: String,
+    val leg1CurrentToPickupKm: Double,
+    val leg2PickupToCustomerKm: Double,
+    val leg3CustomerToCenterKm: Double,
+    val totalKm: Double,
+    val earningsPerKm: Double,
+    val targetPerKm: Double,
+    val decision: String,
+    val decisionReason: String,
+    val neighborhoodAlert: String? = null,
+    val routeSource: String,
+    val usedGpsStart: Boolean
+)
+
+@Entity(tableName = "neighborhood_rules")
+data class NeighborhoodRuleEntity(
+    @PrimaryKey val name: String,
+    val normalizedKey: String,
+    val status: String,
+    val notes: String = "",
+    val isCustom: Boolean = false,
+    val updatedAt: Long = System.currentTimeMillis()
+)

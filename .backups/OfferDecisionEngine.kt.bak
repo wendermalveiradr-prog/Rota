@@ -1,0 +1,103 @@
+package com.example.domain
+
+import com.example.data.local.AnalyzedOfferEntity
+import com.example.data.local.NeighborhoodRuleEntity
+import com.example.data.local.NeighborhoodStatus
+import com.example.data.local.OfferCaptureSource
+import com.example.data.local.TrafficLightDecision
+import com.example.data.preferences.DriverSettings
+import java.util.Locale
+
+object OfferDecisionEngine {
+
+    fun evaluateOffer(
+        source: OfferCaptureSource,
+        rawSnippet: String,
+        offerPriceBrl: Double,
+        pickupAddress: String,
+        customerAddress: String,
+        route: RouteCalculationResult,
+        usedGpsStart: Boolean,
+        neighborhoodRules: List<NeighborhoodRuleEntity>,
+        settings: DriverSettings
+    ): AnalyzedOfferEntity {
+        val safeTotalKm = route.totalKm.coerceAtLeast(0.5)
+        val earningsPerKm = Math.round((offerPriceBrl / safeTotalKm) * 100.0) / 100.0
+        val target = settings.minTargetPerKm
+
+        val pickupRule = MontesClarosGeoCatalog.detectNeighborhoodRule(pickupAddress, neighborhoodRules)
+        val customerRule = MontesClarosGeoCatalog.detectNeighborhoodRule(customerAddress, neighborhoodRules)
+
+        val pickupLabel = pickupRule?.name
+            ?: MontesClarosGeoCatalog.extractNeighborhoodLabel(pickupAddress, neighborhoodRules)
+        val customerLabel = customerRule?.name
+            ?: MontesClarosGeoCatalog.extractNeighborhoodLabel(customerAddress, neighborhoodRules)
+
+        val pickupAvoided = pickupRule?.status == NeighborhoodStatus.AVOIDED.name
+        val customerAvoided = customerRule?.status == NeighborhoodStatus.AVOIDED.name
+        val customerPreferred = customerRule?.status == NeighborhoodStatus.PREFERRED.name
+
+        val avoidedDetails = buildList {
+            if (customerAvoided) {
+                val note = customerRule?.notes?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+                add("Destino evitado: ${customerRule?.name}$note")
+            }
+            if (pickupAvoided && pickupRule?.name != customerRule?.name) {
+                val note = pickupRule?.notes?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+                add("Coleta evitada: ${pickupRule?.name}$note")
+            }
+        }
+        val neighborhoodAlert = avoidedDetails.joinToString(" • ").ifBlank { null }
+
+        val comfortMargin = target * 1.18
+        val isLongReturn = route.leg3CustomerToCenterKm > settings.cautionReturnThresholdKm
+
+        val (decision, reason) = when {
+            customerAvoided || pickupAvoided -> {
+                TrafficLightDecision.RED to "VERMELHO • NÃO COMPENSA: ${neighborhoodAlert ?: "Bairro evitado/perigoso"}"
+            }
+            earningsPerKm < target -> {
+                val formattedRate = formatBrl(earningsPerKm)
+                val formattedTarget = formatBrl(target)
+                TrafficLightDecision.RED to "VERMELHO • NÃO COMPENSA: $formattedRate/km abaixo da meta mínima de $formattedTarget/km"
+            }
+            earningsPerKm < comfortMargin && !customerPreferred -> {
+                val formattedRate = formatBrl(earningsPerKm)
+                TrafficLightDecision.YELLOW to "AMARELO • ATENÇÃO: Margem apertada ($formattedRate/km) considerando retorno ao Centro (${route.leg3CustomerToCenterKm} km)"
+            }
+            isLongReturn -> {
+                TrafficLightDecision.YELLOW to "AMARELO • ATENÇÃO: Retorno longo até o Centro (${route.leg3CustomerToCenterKm} km)"
+            }
+            else -> {
+                val formattedRate = formatBrl(earningsPerKm)
+                val bonusTag = if (customerPreferred) " • Bairro preferido ($customerLabel)" else ""
+                TrafficLightDecision.GREEN to "VERDE • COMPENSA: $formattedRate/km acima da meta$bonusTag"
+            }
+        }
+
+        return AnalyzedOfferEntity(
+            timestamp = System.currentTimeMillis(),
+            source = source.name,
+            rawSnippet = rawSnippet,
+            offerPriceBrl = offerPriceBrl,
+            pickupAddress = pickupAddress,
+            pickupNeighborhood = pickupLabel,
+            customerAddress = customerAddress,
+            customerNeighborhood = customerLabel,
+            leg1CurrentToPickupKm = route.leg1CurrentToPickupKm,
+            leg2PickupToCustomerKm = route.leg2PickupToCustomerKm,
+            leg3CustomerToCenterKm = route.leg3CustomerToCenterKm,
+            totalKm = route.totalKm,
+            earningsPerKm = earningsPerKm,
+            targetPerKm = target,
+            decision = decision.name,
+            decisionReason = reason,
+            neighborhoodAlert = neighborhoodAlert,
+            routeSource = route.routeSource,
+            usedGpsStart = usedGpsStart
+        )
+    }
+
+    private fun formatBrl(value: Double): String =
+        String.format(Locale("pt", "BR"), "R$ %.2f", value)
+}

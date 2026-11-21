@@ -1,0 +1,219 @@
+package com.example.service
+
+import android.accessibilityservice.AccessibilityService
+import android.graphics.Bitmap
+import android.os.Build
+import android.view.Display
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.example.RotaInteligenteApp
+import com.example.data.local.OfferCaptureSource
+import com.example.domain.OfferParser
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+
+class MobLetsAccessibilityService : AccessibilityService() {
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    @Volatile
+    private var lastEventScanMs = 0L
+
+    @Volatile
+    private var lastOcrScanMs = 0L
+
+    @Volatile
+    private var lastOfferSignature = ""
+
+    @Volatile
+    private var lastOfferSavedMs = 0L
+
+    private val ignoredPackages = setOf(
+        "com.android.systemui",
+        "com.google.android.inputmethod.latin",
+        "com.android.settings"
+    )
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        ServiceRuntimeBus.setAccessibilityConnected(true)
+
+        serviceScope.launch {
+            ServiceRuntimeBus.manualOcrTrigger.collectLatest {
+                triggerOcrFallbackScan(
+                    detectedPackage = ServiceRuntimeBus.state.value.lastDetectedPackage.ifBlank { "ocr.manual" },
+                    requireKeywords = false
+                )
+            }
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val pkg = event?.packageName?.toString().orEmpty()
+        if (pkg.isBlank() || pkg == packageName || pkg in ignoredPackages) return
+
+        val now = System.currentTimeMillis()
+        if (now - lastEventScanMs < 900L) return
+        lastEventScanMs = now
+
+        val app = application as? RotaInteligenteApp ?: return
+        val coordinator = app.container.analysisCoordinator
+        val prefs = app.container.preferencesRepository
+
+        serviceScope.launch {
+            val settings = prefs.getSettingsOnce()
+            val isMobLetsPackage = pkg.contains("moblets", ignoreCase = true) ||
+                pkg.contains("mob.lets", ignoreCase = true) ||
+                pkg.contains("mob_lets", ignoreCase = true)
+
+            if (settings.strictMobLetsPackageFilter && !isMobLetsPackage) {
+                return@launch
+            }
+
+            val root = rootInActiveWindow
+            val extractedText = if (root != null) {
+                collectNodeText(root)
+            } else {
+                ""
+            }
+
+            val parsedFromAccessibility = OfferParser.parse(
+                rawText = extractedText,
+                requireDeliveryKeywords = !isMobLetsPackage
+            )
+
+            if (parsedFromAccessibility != null) {
+                val signature = "${parsedFromAccessibility.offerPriceBrl}|${parsedFromAccessibility.pickupAddress}|${parsedFromAccessibility.customerAddress}"
+                if (isDuplicateRecent(signature)) return@launch
+
+                markAnalyzed(signature)
+                coordinator.analyzeStructuredOffer(
+                    priceBrl = parsedFromAccessibility.offerPriceBrl,
+                    pickupAddress = parsedFromAccessibility.pickupAddress,
+                    customerAddress = parsedFromAccessibility.customerAddress,
+                    source = OfferCaptureSource.ACCESSIBILITY,
+                    rawSnippet = parsedFromAccessibility.rawSnippet,
+                    detectedPackage = pkg
+                )
+            } else if (settings.ocrFallbackEnabled && (isMobLetsPackage || extractedText.length < 35)) {
+                if (now - lastOcrScanMs >= 4000L) {
+                    lastOcrScanMs = now
+                    triggerOcrFallbackScan(
+                        detectedPackage = pkg,
+                        requireKeywords = !isMobLetsPackage
+                    )
+                }
+            }
+        }
+    }
+
+    private fun triggerOcrFallbackScan(detectedPackage: String, requireKeywords: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            ServiceRuntimeBus.updateStatusMessage(
+                "Fallback OCR automático requer Android 11+ (use o leitor de print no painel).",
+                detectedPackage
+            )
+            return
+        }
+
+        val app = application as? RotaInteligenteApp ?: return
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            mainExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    val hardwareBuffer = screenshot.hardwareBuffer
+                    val colorSpace = screenshot.colorSpace
+                    val hwBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, colorSpace)
+                    hardwareBuffer.close()
+
+                    if (hwBitmap == null) return
+                    val softwareBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                    hwBitmap.recycle()
+
+                    serviceScope.launch {
+                        try {
+                            val ocrText = app.container.ocrProcessor.extractTextFromBitmap(softwareBitmap)
+                            softwareBitmap.recycle()
+                            val parsed = OfferParser.parse(
+                                rawText = ocrText,
+                                requireDeliveryKeywords = requireKeywords
+                            ) ?: return@launch
+
+                            val signature = "${parsed.offerPriceBrl}|${parsed.pickupAddress}|${parsed.customerAddress}"
+                            if (isDuplicateRecent(signature)) return@launch
+
+                            markAnalyzed(signature)
+                            app.container.analysisCoordinator.analyzeStructuredOffer(
+                                priceBrl = parsed.offerPriceBrl,
+                                pickupAddress = parsed.pickupAddress,
+                                customerAddress = parsed.customerAddress,
+                                source = OfferCaptureSource.OCR_SCREENSHOT,
+                                rawSnippet = parsed.rawSnippet,
+                                detectedPackage = detectedPackage
+                            )
+                        } catch (_: Exception) {
+                            softwareBitmap.recycle()
+                        }
+                    }
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    ServiceRuntimeBus.updateStatusMessage(
+                        "Captura OCR indisponível neste quadro (código $errorCode)",
+                        detectedPackage
+                    )
+                }
+            }
+        )
+    }
+
+    private fun isDuplicateRecent(signature: String): Boolean {
+        val now = System.currentTimeMillis()
+        return signature == lastOfferSignature && (now - lastOfferSavedMs) < 25_000L
+    }
+
+    private fun markAnalyzed(signature: String) {
+        lastOfferSignature = signature
+        lastOfferSavedMs = System.currentTimeMillis()
+    }
+
+    private fun collectNodeText(
+        node: AccessibilityNodeInfo?,
+        depth: Int = 0,
+        builder: StringBuilder = StringBuilder()
+    ): String {
+        if (node == null || depth > 24 || builder.length > 4000) return builder.toString()
+
+        val text = node.text?.toString()?.trim()
+        if (!text.isNullOrBlank()) {
+            builder.append(text).append('\n')
+        } else {
+            val desc = node.contentDescription?.toString()?.trim()
+            if (!desc.isNullOrBlank()) {
+                builder.append(desc).append('\n')
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            collectNodeText(child, depth + 1, builder)
+            child?.recycle()
+        }
+        return builder.toString()
+    }
+
+    override fun onInterrupt() {
+        ServiceRuntimeBus.setAccessibilityConnected(false)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.cancel()
+        ServiceRuntimeBus.setAccessibilityConnected(false)
+    }
+}
